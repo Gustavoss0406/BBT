@@ -195,13 +195,11 @@ class BinanceProvider:
             os.getenv("BINANCE_PROXY_URL") or
             "https://api.binance.com"
         )
-        self.api_key = os.getenv("BINANCE_API_KEY")
-        self.api_secret = os.getenv("BINANCE_API_SECRET")
-        
+        self.api_key = os.getenv("BINANCE_API_KEY")  # opcional, futuro
         self.session = requests.Session()
         headers = {"User-Agent": "Mozilla/5.0 (TradingBot)"}
         if self.api_key:
-            headers["X-MBX-APIKEY"] = self.api_key  # ajuda no rate limit
+            headers["X-MBX-APIKEY"] = self.api_key  # opcional
         self.session.headers.update(headers)
         
     def _fetch_klines(self, interval='1m', start_ms=None, end_ms=None, limit=1000):
