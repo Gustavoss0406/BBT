@@ -203,7 +203,7 @@ class BinanceProvider:
         self.session.headers.update(headers)
         
     def _fetch_klines(self, interval='1m', start_ms=None, end_ms=None, limit=1000):
-        url = f"{self.base_url}/api/v3/klines"
+        url = f"https://www.binance.com/en/api/v3/klines"
         params = {'symbol': self.symbol, 'interval': interval, 'limit': limit}
         if start_ms is not None:
             params['startTime'] = int(start_ms)
