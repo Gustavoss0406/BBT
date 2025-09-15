@@ -189,16 +189,15 @@ def handle_exception(e):
 # =====================================================================================
 class BinanceProvider:
     def __init__(self, symbol='BTCUSDT', base_url=None):
-            self.symbol = symbol
-            # 🔁 Se variável de ambiente estiver setada, usa ela
-            self.base_url = (
-                base_url or
-                os.getenv("BINANCE_PROXY_URL") or
-                "https://api.binance.com"
-            )
+        self.symbol = symbol
+        # 🔁 Se variável de ambiente estiver setada, usa ela
+        self.base_url = (
+            base_url or
+            os.getenv("BINANCE_PROXY_URL") or
+            "https://api.binance.com"
+        )
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (TradingBot)"})
-
     def _fetch_klines(self, interval='1m', start_ms=None, end_ms=None, limit=1000):
         url = f"{self.base_url}/api/v3/klines"
         params = {'symbol': self.symbol, 'interval': interval, 'limit': limit}
