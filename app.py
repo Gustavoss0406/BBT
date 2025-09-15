@@ -188,9 +188,14 @@ def handle_exception(e):
 # Binance Provider
 # =====================================================================================
 class BinanceProvider:
-    def __init__(self, symbol='BTCUSDT', base_url='https://api.binance.com'):
-        self.symbol = symbol
-        self.base_url = base_url
+    def __init__(self, symbol='BTCUSDT', base_url=None):
+            self.symbol = symbol
+            # 🔁 Se variável de ambiente estiver setada, usa ela
+            self.base_url = (
+                base_url or
+                os.getenv("BINANCE_PROXY_URL") or
+                "https://api.binance.com"
+            )
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (TradingBot)"})
 
