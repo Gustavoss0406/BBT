@@ -193,7 +193,7 @@ class BinanceProvider:
         self.base_url = (
             base_url or
             os.getenv("BINANCE_PROXY_URL") or
-            "https://api.binance.com"
+            "https://api.binance.com/en"
         )
         self.api_key = os.getenv("BINANCE_API_KEY")  # opcional, futuro
         self.session = requests.Session()
