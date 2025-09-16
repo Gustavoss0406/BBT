@@ -22,6 +22,19 @@ import requests
 from flask import Flask, request, send_from_directory, Response
 from flask_cors import CORS
 
+# =====================================================================================
+# Logger / Flask
+# =====================================================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    from statsmodels.tsa.stattools import adfuller
+    STATS_AVAILABLE = True
+except ImportError:
+    STATS_AVAILABLE = False
+    logger.warning("statsmodels não disponível. Teste de estacionariedade desativado.")
+
 # ===== Optional scikit-learn (ML) =====
 SKLEARN_AVAILABLE = True
 try:
@@ -71,7 +84,7 @@ CORS(app)
 # =====================================================================================
 DEFAULT_PARAMS = {
     'ml_enabled': True,
-    'timeframes': [1, 5, 15],
+    'timeframes': [5, 15],
     'weights': {'ml': 0.5, 'rule': 0.3, 'mtf': 0.2},
     'thresholds': {'buy': 60, 'sell': 60, 'strong': 75, 'rule_min_conditions': 3},
     'vol_filters': {
@@ -85,8 +98,8 @@ DEFAULT_PARAMS = {
         'realized_vol_max': 0.02
     },
     'risk': {
-        'atr_stop_mult': 1.5,
-        'atr_target_mult': 2.5,
+        'atr_stop_mult': 2.5,
+        'atr_target_mult': 3.0,
         'min_minutes_between_trades': 15,   # menor refratariedade para aumentar cadência
         'max_trades_per_day': 12,           # mais operações permitidas por dia
         'daily_target_pct_of_initial': 0.5
@@ -99,7 +112,7 @@ DEFAULT_PARAMS = {
         'random_state': 42
     },
     'optimization': {'trials': 20, 'objective': 'sharpe'},
-    'data': {'base_interval': '1m', 'max_hist_days': 7, 'allow_simulation': False}
+    'data': {'base_interval': '1m', 'max_hist_days': 14, 'allow_simulation': False}
 }
 
 # 5 perfis de estratégia
@@ -184,26 +197,49 @@ def handle_exception(e):
         return json_response({'success': False, 'error': 'internal_server_error', 'detail': str(e)}, 500)
     return ("Internal Server Error", 500)
 
+
+
+# ================ FrozenEstimator (para CalibratedClassifierCV) ================
+class FrozenEstimator:
+    """
+    Wrapper para congelar um estimador já treinado.
+    Necessário para uso com CalibratedClassifierCV(cv='prefit').
+    Copia atributos essenciais para compatibilidade com scikit-learn.
+    """
+    def __init__(self, estimator):
+        self.estimator = estimator
+        # Copia atributos importantes para validação sklearn
+        for attr in dir(estimator):
+            if not attr.startswith('_') or attr in ['_estimator_type', '_validate_data']:
+                try:
+                    value = getattr(estimator, attr)
+                    if not callable(value) or attr in ['predict_proba', 'decision_function', 'predict']:
+                        setattr(self, attr, value)
+                except Exception:
+                    pass  # ignora se falhar
+
+    def predict_proba(self, X):
+        return self.estimator.predict_proba(X)
+
+    def predict(self, X):
+        return self.estimator.predict(X)
+
+    def fit(self, X, y=None, **kwargs):
+        # Não faz nada — já foi treinado
+        return self 
+
 # =====================================================================================
 # Binance Provider
 # =====================================================================================
 class BinanceProvider:
-    def __init__(self, symbol='BTCUSDT', base_url=None):
+    def __init__(self, symbol='BTCUSDT', base_url='https://api.binance.com'):
         self.symbol = symbol
-        self.base_url = (
-            base_url or
-            os.getenv("BINANCE_PROXY_URL") or
-            "https://api.binance.com"
-        )
-        self.api_key = os.getenv("BINANCE_API_KEY")  # opcional, futuro
+        self.base_url = base_url
         self.session = requests.Session()
-        headers = {"User-Agent": "Mozilla/5.0 (TradingBot)"}
-        if self.api_key:
-            headers["X-MBX-APIKEY"] = self.api_key  # opcional
-        self.session.headers.update(headers)
-        
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (TradingBot)"})
+
     def _fetch_klines(self, interval='1m', start_ms=None, end_ms=None, limit=1000):
-        url = f"https://www.binance.com/en/api/v3/klines"
+        url = f"{self.base_url}/api/v3/klines"
         params = {'symbol': self.symbol, 'interval': interval, 'limit': limit}
         if start_ms is not None:
             params['startTime'] = int(start_ms)
@@ -376,6 +412,29 @@ class TechnicalIndicators:
             lows = np.array([d['low'] for d in data_list], dtype=float)
             volumes = np.array([d['volume'] for d in data_list], dtype=float)
 
+            # 👇 NOVO: Padrões Candlestick Simples
+            if len(data_list) > 0:
+                last_candle = data_list[-1]
+                open_price = float(last_candle['open'])
+                close_price = prices[-1]
+                high_price = highs[-1]
+                low_price = lows[-1]
+
+                body = abs(close_price - open_price)
+                upper_wick = high_price - max(close_price, open_price)
+                lower_wick = min(close_price, open_price) - low_price
+
+                candle_pattern = 0
+                # Martelo Bullish: mecha inferior grande + corpo pequeno + fecha no topo
+                if body > 0 and lower_wick > body * 2 and close_price > open_price:
+                    candle_pattern = -1  # sinal de COMPRA (reversão de fundo)
+                # Estrela Cadente Bearish: mecha superior grande + corpo pequeno + fecha no fundo
+                elif body > 0 and upper_wick > body * 2 and close_price < open_price:
+                    candle_pattern = 1   # sinal de VENDA (reversão de topo)
+            else:
+                candle_pattern = 0
+
+            # --- Indicadores Originais ---
             rsi = TechnicalIndicators._rsi(prices, 7)
 
             bb_period, bb_std_dev = 15, 1.8
@@ -404,6 +463,56 @@ class TechnicalIndicators:
             atr = TechnicalIndicators._atr(highs, lows, prices, 14)
             ema_slope = TechnicalIndicators._ema_slope(prices, 8)
 
+            # --- NOVAS FEATURES: DIVERGÊNCIA + VOLUME DRYING ---
+
+            # 1. Divergência RSI/Preço (janela de 8 velas)
+            rsi_series = []
+            for i in range(len(prices)):
+                window = prices[max(0, i-6):i+1]
+                if len(window) < 2:
+                    rsi_series.append(50.0)
+                else:
+                    deltas = np.diff(window)
+                    gains = np.where(deltas > 0, deltas, 0)
+                    losses = np.where(deltas < 0, -deltas, 0)
+                    avg_gain = np.mean(gains[-7:]) if len(gains) >= 7 else (np.mean(gains) if len(gains) > 0 else 0.0)
+                    avg_loss = np.mean(losses[-7:]) if len(losses) >= 7 else (np.mean(losses) if len(losses) > 0 else 0.0)
+                    if avg_loss == 0:
+                        rsiv = 100.0
+                    else:
+                        rs = avg_gain / avg_loss
+                        rsiv = 100.0 - (100.0 / (1.0 + rs))
+                    rsi_series.append(float(rsiv))
+
+            divergence = 0
+            if len(prices) >= 8:
+                recent_prices = prices[-8:]
+                recent_rsi = rsi_series[-8:]
+
+                price_high_idx = np.argmax(recent_prices)
+                rsi_high_idx = np.argmax(recent_rsi)
+
+                price_low_idx = np.argmin(recent_prices)
+                rsi_low_idx = np.argmin(recent_rsi)
+
+                # Divergência de baixa: novo high de preço, mas RSI mais baixo
+                if price_high_idx == 7 and rsi_high_idx != 7:
+                    if recent_rsi[7] < recent_rsi[rsi_high_idx] * 0.95:
+                        divergence = 1  # Sinal de venda
+
+                # Divergência de alta: novo low de preço, mas RSI mais alto
+                if price_low_idx == 7 and rsi_low_idx != 7:
+                    if recent_rsi[7] > recent_rsi[rsi_low_idx] * 1.05:
+                        divergence = -1  # Sinal de compra
+
+            # 2. Volume Drying: volume atual < 70% da média dos últimos 5 candles
+            volume_drying = 0
+            if len(volumes) >= 5:
+                vol_avg_5 = np.mean(volumes[-5:-1])  # exclui o atual
+                if volumes[-1] < vol_avg_5 * 0.7 and vol_avg_5 > 0:
+                    volume_drying = 1
+
+            # --- Retorno Final ---
             return {
                 'rsi': float(rsi),
                 'bb_upper': float(upper), 'bb_middle': float(mid), 'bb_lower': float(lower),
@@ -413,10 +522,16 @@ class TechnicalIndicators:
                 'macd': float(macd_line), 'macd_signal': float(macd_signal), 'macd_histogram': float(macd_hist),
                 'stoch_k': float(stoch_k), 'stoch_d': float(stoch_d),
                 'volume_ratio': float(vol_ratio), 'atr': float(atr),
-                'ema_slope': float(ema_slope)
+                'ema_slope': float(ema_slope),
+
+                # 👇 NOVAS FEATURES
+                'divergence': int(divergence),      # -1=compra, 0=neutro, 1=venda
+                'volume_drying': int(volume_drying), # 1=volume secando, 0=normal
+                'candle_pattern': int(candle_pattern)  # -1=buy reversal, 0=neutro, 1=sell reversal
             }
+
         except Exception as e:
-            logger.error(f"Indicadores: {e}")
+            logger.error(f"Erro no cálculo de indicadores: {e}")
             return {}
 
     @staticmethod
@@ -510,6 +625,36 @@ class TechnicalIndicators:
             return 0.0
         denom = max(1e-9, abs(vals[-2]))
         return float((vals[-1] - vals[-2]) / denom)
+    
+    @staticmethod
+    def _detect_divergence(prices, rsi_values, window=10):
+        """
+        Detecta divergência de baixa (preço faz novo high, RSI não) → sinal de reversão.
+        Retorna: 1 = divergência de baixa (venda), -1 = divergência de alta (compra), 0 = neutro.
+        """
+        if len(prices) < window or len(rsi_values) < window:
+            return 0
+
+        recent_prices = prices[-window:]
+        recent_rsi = rsi_values[-window:]
+
+        price_high_idx = np.argmax(recent_prices)
+        rsi_high_idx = np.argmax(recent_rsi)
+
+        price_low_idx = np.argmin(recent_prices)
+        rsi_low_idx = np.argmin(recent_rsi)
+
+        # Divergência de baixa: preço > anterior, RSI < anterior
+        if price_high_idx == len(recent_prices) - 1 and rsi_high_idx != len(recent_rsi) - 1:
+            if recent_rsi[-1] < recent_rsi[rsi_high_idx] * 0.95:  # RSI caiu 5%+
+                return 1  # Sinal de venda (divergência de baixa)
+
+        # Divergência de alta: preço < anterior, RSI > anterior
+        if price_low_idx == len(recent_prices) - 1 and rsi_low_idx != len(recent_rsi) - 1:
+            if recent_rsi[-1] > recent_rsi[rsi_low_idx] * 1.05:  # RSI subiu 5%+
+                return -1  # Sinal de compra (divergência de alta)
+
+        return 0
 
 # =====================================================================================
 # MultiTimeframe Feature Builder (com microestrutura + robustez)
@@ -527,8 +672,8 @@ class MultiTimeframeFeatureBuilder:
         return out
 
     def indicators_df(self, df,
-                      rsi_period=7, bb_period=15, ema_period=8, stoch_period=14,
-                      atr_period=14, vol_sma_period=10):
+                    rsi_period=7, bb_period=15, ema_period=8, stoch_period=14,
+                    atr_period=14, vol_sma_period=10):
         if df is None or df.empty:
             return pd.DataFrame()
         out = pd.DataFrame(index=df.index.copy())
@@ -596,15 +741,55 @@ class MultiTimeframeFeatureBuilder:
         out['ret_z20'] = (out['ret_1'] - out['ret_1'].rolling(20).mean()) / (out['ret_1'].rolling(20).std().replace(0, np.nan))
         out['ret_z20'] = out['ret_z20'].replace([np.inf, -np.inf], 0.0).fillna(0.0)
         out['vol_z20'] = (pd.Series(v, index=df.index) - pd.Series(v, index=df.index).rolling(20).mean()) / \
-                         (pd.Series(v, index=df.index).rolling(20).std().replace(0, np.nan))
+                        (pd.Series(v, index=df.index).rolling(20).std().replace(0, np.nan))
         out['vol_z20'] = out['vol_z20'].replace([np.inf, -np.inf], 0.0).fillna(0.0)
         out['atr_n'] = out['atr'] / s.replace(0, np.nan)
         out['atr_n'] = out['atr_n'].replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
+        # Volume drying at highs
+        vol_rolling = pd.Series(v, index=df.index).rolling(5, min_periods=1).mean()
+        vol_ratio_5 = pd.Series(v, index=df.index) / vol_rolling.replace(0, np.nan)
+        out['volume_drying'] = (vol_ratio_5 < 0.7).astype(int)  # True se volume caiu 30%+ nas últimas 5 velas
+
+        # ================================
+        # 👇 NOVAS FEATURES: ORDER FLOW 👇
+        # ================================
+
+        # 1. Volume Imbalance: mede se o volume está vindo com força compradora ou vendedora
+        price_change = s.diff()
+        volume_direction = np.sign(price_change) * v  # positivo = volume com alta, negativo = com baixa
+        out['volume_imbalance'] = (
+            pd.Series(volume_direction, index=df.index)
+            .rolling(20, min_periods=5)
+            .sum()
+            .fillna(0.0)
+        )
+
+        # 2. VPIN Proxy (Volume-Synchronized Probability of Informed Trading) — simplificado
+        # Mede desequilíbrio entre "compra agressiva" e "venda agressiva"
+        # Aqui usamos: sinal do retorno * volume como proxy de fluxo informado
+        signed_volume = price_change * v  # positivo = compra dominante, negativo = venda dominante
+        total_volume = pd.Series(v, index=df.index).rolling(20, min_periods=5).sum()
+        out['vpin_proxy'] = (
+            (pd.Series(signed_volume, index=df.index).rolling(20, min_periods=5).sum())
+            / (total_volume.replace(0, np.nan))
+        ).fillna(0.0).clip(-1, 1)
+
+        # 3. Spread Proxy: quanto maior o range relativo, menos líquido o candle (maior slippage potencial)
+        out['spread_proxy'] = ((hs - ls) / s.replace(0, np.nan)).fillna(0.0)
+
+        # ================================
+        # 👆 FIM DAS NOVAS FEATURES 👆
+        # ================================
+
         out = out.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+        for col in out.columns:
+            if out[col].isna().any():
+                median = out[col].median()
+                out[col] = out[col].fillna(median if pd.notna(median) else 0.0)
         return out
 
-    def build_mtf_features(self, df, timeframes=[1, 5, 15]):
+    def build_mtf_features(self, df, timeframes=[5, 15]):
         if df is None or df.empty:
             return pd.DataFrame()
         f1 = self.indicators_df(df).add_prefix('f1m_')
@@ -633,59 +818,136 @@ class MultiTimeframeFeatureBuilder:
                 features_df[col] = features_df[col].fillna(median if pd.notna(median) else 0.0)
         return features_df.loc[:, ~features_df.columns.duplicated()]
 
-    def build_ml_dataset(self, df, horizon=3, timeframes=[1, 5, 15], use_triple_barrier=True,
-                         atr_mult_stop=1.5, atr_mult_target=2.5):
+    def build_ml_dataset(self, df, horizon=3, timeframes=[5, 15], use_triple_barrier=True,
+                        atr_mult_stop=1.5, atr_mult_target=2.5):
         feats = self.build_mtf_features(df, timeframes=timeframes)
         if feats is None or feats.empty:
             feats = self.indicators_df(df).add_prefix('f1m_').replace([np.inf, -np.inf], np.nan).ffill().bfill()
         if feats is None or feats.empty:
-            return np.empty((0, 0)), np.array([], dtype=int), [], pd.DataFrame(), pd.DataFrame()
+            return np.empty((0, 0)), np.array([], dtype=int), [], pd.DataFrame(), pd.DataFrame(), None
 
         base = df.loc[feats.index].copy()
         aligned = pd.concat([base, feats], axis=1)
         aligned = aligned.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna()
         if aligned.empty:
-            return np.empty((0, 0)), np.array([], dtype=int), [], pd.DataFrame(), pd.DataFrame()
+            return np.empty((0, 0)), np.array([], dtype=int), [], pd.DataFrame(), pd.DataFrame(), None
 
+        # 👇 NOVO: Teste de Estacionariedade (ADF) em cada feature
+        stationary_features = []
+        non_stationary_features = []
+
+        if STATS_AVAILABLE:
+            for col in feats.columns:
+                try:
+                    series = aligned[col].dropna()
+                    if len(series) < 20:
+                        continue
+                    result = adfuller(series, autolag='AIC')
+                    p_value = result[1]
+                    if p_value < 0.05:  # estacionária ao nível de 5%
+                        stationary_features.append(col)
+                    else:
+                        non_stationary_features.append(col)
+                except Exception as e:
+                    logger.debug(f"Erro no teste ADF para {col}: {e}")
+                    stationary_features.append(col)  # fallback: mantém se der erro
+
+            if non_stationary_features:
+                logger.info(f"[ADF Filter] Features não estacionárias removidas ({len(non_stationary_features)}): {non_stationary_features[:5]}{'...' if len(non_stationary_features) > 5 else ''}")
+                # 👇 ADICIONE AO METRICS
+                if hasattr(self, '_last_metrics'):
+                    self._last_metrics['non_stationary_removed'] = len(non_stationary_features)
+            else:
+                if hasattr(self, '_last_metrics'):
+                    self._last_metrics['non_stationary_removed'] = 0
+            if stationary_features:
+                feats = feats[stationary_features]
+            else:
+                logger.warning("Nenhuma feature passou no teste de estacionariedade. Mantendo todas.")
+        else:
+            logger.debug("Teste de estacionariedade ignorado (statsmodels indisponível).")
+
+        # Continua normalmente
         if use_triple_barrier:
-            y = self._triple_barrier_labels(aligned, horizon=horizon,
-                                            atr_col='f1m_atr', atr_mult_stop=atr_mult_stop,
-                                            atr_mult_target=atr_mult_target)
+            y, sample_weights = self._triple_barrier_labels(aligned, horizon=horizon,
+                                                            atr_col='f1m_atr', atr_mult_stop=atr_mult_stop,
+                                                            atr_mult_target=atr_mult_target)
         else:
             future = aligned['close'].shift(-horizon)
             y = (future > aligned['close']).astype(int).values
+            sample_weights = None
 
         y = y[:len(aligned)]
         mask = ~pd.isna(y)
         y = y[mask]
         X = aligned.loc[mask, feats.columns].values
-        return X, y.astype(int), list(feats.columns), feats, aligned.loc[mask]
+        sample_weights = sample_weights[mask] if sample_weights is not None else None
 
-    def _triple_barrier_labels(self, aligned_df, horizon=3, atr_col='f1m_atr',
-                               atr_mult_stop=1.5, atr_mult_target=2.5):
+        metrics = {
+        'non_stationary_removed': len(non_stationary_features) if non_stationary_features else 0
+        }
+
+        return X, y.astype(int), list(feats.columns), feats, aligned.loc[mask], sample_weights, metrics
+
+    def _triple_barrier_labels(self, aligned_df, horizon=5, atr_col='f1m_atr',
+                            atr_mult_stop=2.0, atr_mult_target=2.0):
+        """
+        Retorna rótulos binários (0/1) E vetor de confiança (0..1) baseado em:
+        - Velocidade de atingir barreira (quanto mais rápido, mais confiável)
+        - Magnitude do movimento relativo ao preço de entrada
+        """
         close = aligned_df['close'].values
         atr = aligned_df[atr_col].values if atr_col in aligned_df.columns else np.full_like(close, np.std(close) * 0.01)
         n = len(close)
         labels = np.zeros(n, dtype=float) * np.nan
+        confidences = np.zeros(n, dtype=float) * np.nan  # ← NOVO: vetor de confiança
+
+        min_volatility = 0.001  # mínimo relativo ao preço para evitar barreiras muito apertadas
+
         for i in range(n):
             entry = close[i]
-            up = entry + atr_mult_target * atr[i]
-            dn = entry - atr_mult_stop * atr[i]
+            # Garante volatilidade mínima para definir barreiras
+            volatility_buffer = max(atr[i], min_volatility * entry)
+            up = entry + atr_mult_target * volatility_buffer
+            dn = entry - atr_mult_stop * volatility_buffer
             end = min(n - 1, i + horizon)
+
             outcome = None
+            barrier_hit_time = horizon  # por padrão, assume que levou todo o horizonte
+
+            # Verifica barreiras em sequência
             for j in range(i + 1, end + 1):
                 if close[j] >= up:
                     outcome = 1
+                    barrier_hit_time = j - i
                     break
                 if close[j] <= dn:
                     outcome = 0
+                    barrier_hit_time = j - i
                     break
+
+            # Se nenhuma barreira foi atingida, usa fechamento no final do horizonte
             if outcome is None:
                 outcome = 1 if close[end] > entry else 0
+                barrier_hit_time = horizon
+
             labels[i] = outcome
-        return labels
+
+            # Calcula confiança:
+            # 1. Baseado na velocidade: quanto mais rápido, mais confiável
+            speed_conf = 1.0 - (barrier_hit_time / max(1, horizon))  # ex: hit em 1 de 5 → 0.8
+
+            # 2. Baseado na magnitude do movimento (normalizado pelo preço)
+            magnitude = abs(close[i + barrier_hit_time if i + barrier_hit_time < n else end] - entry) / entry
+            mag_conf = min(magnitude / 0.02, 1.0)  # normaliza até 2% de movimento (ajustável)
+
+            # Combina os dois fatores
+            confidence_score = (speed_conf * 0.6) + (mag_conf * 0.4)
+            confidences[i] = np.clip(confidence_score, 0.0, 1.0)
+
+        return labels, confidences  # ← AGORA RETORNA DOIS VETORES
     
-    def latest_feature_row(self, df, timeframes=[1,5,15]):
+    def latest_feature_row(self, df, timeframes=[5,15]):
             feats = self.build_mtf_features(df, timeframes=timeframes)
             if feats is None or feats.empty:
                 return None, []
@@ -695,6 +957,56 @@ class MultiTimeframeFeatureBuilder:
 # =====================================================================================
 # Filters
 # =====================================================================================
+
+class MarketRegimeFilter:
+    """
+    Avalia o regime de mercado global usando BTC como referência.
+    Retorna um score de 0.0 (bear forte) a 1.0 (bull forte).
+    Usado para ajustar a confiança dos sinais em altcoins.
+    """
+    def __init__(self, bot_manager):
+        self.bot_manager = bot_manager
+        self.last_check = None
+        self.cache_duration_sec = 60  # atualiza a cada 1 minuto
+        self.cached_regime_score = 0.5
+
+    def get_market_regime_score(self):
+        now = datetime.now()
+        if self.last_check and (now - self.last_check).total_seconds() < self.cache_duration_sec:
+            return self.cached_regime_score
+
+        try:
+            btc_status = self.bot_manager.status('BTC')
+            if not btc_status.get('success') or 'signal' not in btc_status:
+                self.cached_regime_score = 0.5
+                self.last_check = now
+                return 0.5
+
+            sig = btc_status['signal']
+            strength = sig.get('strength', 0)
+            signal_type = sig.get('signal', 'HOLD')
+
+            if signal_type == 'BUY' and strength >= 70:
+                score = 1.0  # bull forte
+            elif signal_type == 'SELL' and strength >= 70:
+                score = 0.0  # bear forte
+            elif signal_type == 'BUY' and strength >= 55:
+                score = 0.7  # bull moderado
+            elif signal_type == 'SELL' and strength >= 55:
+                score = 0.3  # bear moderado
+            else:
+                score = 0.5  # neutro
+
+            self.cached_regime_score = score
+            self.last_check = now
+            return score
+
+        except Exception as e:
+            logger.warning(f"Erro ao obter regime de mercado: {e}")
+            return 0.5
+
+
+
 class VolatilityVolumeFilter:
     @staticmethod
     def evaluate(df_1m, params):
@@ -708,6 +1020,26 @@ class VolatilityVolumeFilter:
             'realized_vol': 0.8
         })
 
+        # 👇 NOVO: Configuração de volume mínimo por ticker (opcional)
+        min_volume_config = p.get('min_volume_usd_per_ticker', {
+            'BTCUSDT': 800000,   # Bitcoin: altíssima liquidez exigida
+            'ETHUSDT': 600000,   # Ethereum: também exige segurança máxima
+            'BNBUSDT': 300000,   # BNB: bom volume, reduzimos um pouco
+            'SOLUSDT': 250000,   # Solana: ativo sólido, volume robusto
+            'AVAXUSDT': 150000,  # Avalanche: crescente, volume médio
+            'LINKUSDT': 120000,  # Chainlink: bom volume institucional
+            'ADAUSDT': 100000,   # Cardano: comunidade grande, volume variável
+            'XRPUSDT': 90000,    # Ripple: judicial, mas volume ainda alto
+            'MATICUSDT': 80000,  # Polygon: ativo de layer2, volume bom
+            'DOGEUSDT': 70000,   # Dogecoin: memecoin, mas ainda com volume considerável
+            'default': 100000    # Fallback seguro para qualquer outro
+        },
+        )
+
+        # 👇 Tenta identificar o ticker do DataFrame (se disponível via atributo)
+        ticker = getattr(df_1m, 'ticker', 'default')
+        min_volume_threshold = min_volume_config.get(ticker, min_volume_config.get('default', 100000))
+
         win_atr = p.get('atr_window', 14)
         min_len = max(50, win_atr + 5, p.get('realized_vol_window', 30) + 5, 24)
         if len(df_1m) < min_len:
@@ -720,7 +1052,7 @@ class VolatilityVolumeFilter:
         hc = (hs - s.shift(1)).abs()
         lc = (ls - s.shift(1)).abs()
         tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-        atr_ser = tr.rolling(win_atr, min_periods=2).mean().fillna(method='bfill')
+        atr_ser = tr.rolling(win_atr, min_periods=2).mean().bfill()
 
         if atr_ser.empty:
             return True, 1.0, ["Filtro: ATR indisponível"]
@@ -750,6 +1082,10 @@ class VolatilityVolumeFilter:
         rv_list = [x for x in [rv1, rv2, rv3] if not np.isnan(x)]
         rv = float(np.median(rv_list)) if rv_list else 0.0
 
+        # 👇 NOVO: Filtro de Liquidez Mínima em USD
+        current_volume_usd = float(df_1m['volume'].iloc[-1]) * float(df_1m['close'].iloc[-1])
+        pass_liquidity = current_volume_usd >= min_volume_threshold
+
         # Limites configuráveis
         pass_vol = bool(atr_min <= atr_cur <= atr_max)
         pass_volume = bool(p.get('volume_ratio_min', 0.9) <= vol_ratio <= p.get('volume_ratio_max', 3.0))
@@ -768,6 +1104,12 @@ class VolatilityVolumeFilter:
         if not pass_rv:
             reasons.append(f"RV {rv:.6f} ∉ [{p.get('realized_vol_min')}, {p.get('realized_vol_max')}]")
             mult *= penalty_weights['realized_vol']
+
+        # 👇 NOVO: Penalidade forte se liquidez insuficiente
+        if not pass_liquidity:
+            reasons.append(f"Liquidez: ${current_volume_usd:,.0f} < ${min_volume_threshold:,.0f}")
+            mult *= 0.1  # penaliza fortemente, mas NÃO BLOQUEIA totalmente (permite trades em memecoins com warning)
+            # Não setamos pass_liquidity=False no "pass_all", pois queremos permitir trades em DOGE/SHIB com penalidade
 
         if all([pass_vol, pass_volume, pass_rv]):
             reasons.append("✅ Filtros OK")
@@ -986,7 +1328,7 @@ class MLPatternModel:
         # isotonic é mais pesado; usar sigmoid por padrão, isotonic se dataset pequeno
         return 'isotonic' if n_samples <= 5000 else 'sigmoid'
 
-    def train(self, X, y, feature_names):
+    def train(self, X, y, feature_names, sample_weights=None, metrics=None):
         if not SKLEARN_AVAILABLE:
             self.trained = False
             return {'sklearn_available': False}
@@ -1006,6 +1348,8 @@ class MLPatternModel:
                 if n > max_n:
                     X = X[-max_n:]
                     y = y[-max_n:]
+                    if sample_weights is not None:
+                        sample_weights = sample_weights[-max_n:]
                     n = max_n
 
                 self.feature_names = feature_names
@@ -1015,6 +1359,9 @@ class MLPatternModel:
                 split_idx = max(10, int(n * (1 - holdout_ratio)))
                 X_train, y_train = X[:split_idx], y[:split_idx]
                 X_hold, y_hold = X[split_idx:], y[split_idx:]
+
+                sw_train = sample_weights[:split_idx] if sample_weights is not None else None
+                sw_hold = sample_weights[split_idx:] if sample_weights is not None else None
 
                 # Escalonador (mesmo que árvores não precisem, mantém pipeline consistente)
                 self.scaler = StandardScaler()
@@ -1038,11 +1385,14 @@ class MLPatternModel:
                 n_splits = 5 if n >= 2000 else (4 if n >= 1200 else (3 if n >= 600 else 2))
                 tss = TimeSeriesSplit(n_splits=n_splits)
 
-                # Hiperparam busca leve
+                # Hiperparam busca leve + regularização embutida
                 rf_base = RandomForestClassifier(
                     n_estimators=self.params.get('n_estimators', 150),
                     max_depth=self.params.get('max_depth', 6),
                     min_samples_leaf=self.params.get('min_samples_leaf', 5),
+                    min_samples_split=5,           # ← EVITA SPLIT EM GRUPOS MINÚSCULOS
+                    max_features='sqrt',           # ← REDUZ VARIÂNCIA (REGULARIZAÇÃO)
+                    ccp_alpha=0.001,               # ← PODA ÁRVORES COMPLEXAS (COST-COMPLEXITY PRUNING)
                     random_state=self.params.get('random_state', 42),
                     class_weight='balanced_subsample',
                     bootstrap=True,
@@ -1054,8 +1404,11 @@ class MLPatternModel:
                     'n_estimators': randint(80, 180),
                     'max_depth': randint(4, 10),
                     'min_samples_leaf': randint(2, 8),
-                    'max_features': uniform(0.5, 0.5)  # 0.5..1.0
+                    'min_samples_split': randint(3, 10),   # ← AJUSTÁVEL NA BUSCA
+                    'max_features': uniform(0.5, 0.5),     # 0.5..1.0
+                    'ccp_alpha': uniform(0.0001, 0.005)    # ← AJUSTE FINO DE PRUNING
                 }
+
                 search = RandomizedSearchCV(
                     rf_base,
                     param_distributions=param_distributions,
@@ -1066,7 +1419,13 @@ class MLPatternModel:
                     n_jobs=1,  # para não estourar CPU no M1
                     verbose=0
                 )
-                search.fit(Xsel_train, y_train)
+
+                # Treina com pesos se disponíveis
+                fit_params = {}
+                if sw_train is not None and len(sw_train) == len(y_train):
+                    fit_params['sample_weight'] = sw_train
+
+                search.fit(Xsel_train, y_train, **fit_params)
                 best_rf = search.best_estimator_
 
                 # Métricas de CV
@@ -1075,7 +1434,7 @@ class MLPatternModel:
                 try:
                     if hasattr(best_rf, 'oob_decision_function_') and best_rf.oob_decision_function_ is not None:
                         oob_proba = best_rf.oob_decision_function_[:, 1]
-                        oob_auc = float(roc_auc_score(y_train, oob_proba))
+                        oob_auc = float(roc_auc_score(y_train, oob_proba, sample_weight=sw_train)) if sw_train is not None else float(roc_auc_score(y_train, oob_proba))
                     else:
                         oob_auc = None
                 except Exception:
@@ -1094,8 +1453,20 @@ class MLPatternModel:
                     logger.error("RandomForest não treinado corretamente.")
                     return {'trained': False, 'error': 'RandomForest não treinado.'}
 
-                calibrated = CalibratedClassifierCV(estimator=best_rf, method=self.calibration, cv='prefit')
-                calibrated.fit(Xsel_hold, y_hold)
+                # 👇 Nova forma recomendada
+                from sklearn.calibration import CalibratedClassifierCV
+
+                calibrated = CalibratedClassifierCV(
+                    estimator=FrozenEstimator(best_rf),
+                    method=self.calibration,
+                    cv='prefit'
+                )
+
+                # Calibra com pesos se disponíveis
+                if sw_hold is not None and len(sw_hold) == len(y_hold):
+                    calibrated.fit(Xsel_hold, y_hold, sample_weight=sw_hold)
+                else:
+                    calibrated.fit(Xsel_hold, y_hold)
 
                 if not hasattr(calibrated, "classes_"):
                     logger.error("CalibratedClassifierCV não foi treinado corretamente.")
@@ -1105,55 +1476,72 @@ class MLPatternModel:
                 self.trained = True
                 # Holdout AUC
                 hold_proba = calibrated.predict_proba(Xsel_hold)[:, 1]
-                hold_auc = float(roc_auc_score(y_hold, hold_proba)) if len(np.unique(y_hold)) > 1 else None
+                hold_auc = float(roc_auc_score(y_hold, hold_proba, sample_weight=sw_hold)) if sw_hold is not None else float(roc_auc_score(y_hold, hold_proba)) if len(np.unique(y_hold)) > 1 else None
 
                 # Ajuste anti-over/underfitting
-                # Se gap grande (cv >> holdout), reduzir profundidade
                 gap = None
                 if cv_auc is not None and hold_auc is not None:
                     gap = float(cv_auc - hold_auc)
                 if gap is not None and gap > 0.08:
-                    # Overfit -> apertar
+                    # Overfit → apertar
                     tuned_rf = RandomForestClassifier(
                         n_estimators=max(80, int(best_rf.n_estimators * 0.8)),
                         max_depth=max(3, int((best_rf.max_depth or 8) * 0.8)),
                         min_samples_leaf=min(10, max(3, int(best_rf.min_samples_leaf * 1.5))),
+                        min_samples_split=best_rf.min_samples_split + 2,  # ← MAIS CONSERVADOR
+                        max_features='sqrt',
+                        ccp_alpha=best_rf.ccp_alpha * 2,                   # ← MAIS PODA
                         random_state=self.params.get('random_state', 42),
                         class_weight='balanced_subsample',
                         bootstrap=True,
                         n_jobs=self._max_jobs,
                         oob_score=True
                     )
-                    tuned_rf.fit(Xsel_train, y_train)
+                    fit_params_tune = {}
+                    if sw_train is not None:
+                        fit_params_tune['sample_weight'] = sw_train
+                    tuned_rf.fit(Xsel_train, y_train, **fit_params_tune)
                     calibrated = CalibratedClassifierCV(base_estimator=tuned_rf, method=self.calibration, cv='prefit')
-                    calibrated.fit(Xsel_hold, y_hold)
+                    if sw_hold is not None:
+                        calibrated.fit(Xsel_hold, y_hold, sample_weight=sw_hold)
+                    else:
+                        calibrated.fit(Xsel_hold, y_hold)
                     try:
                         if hasattr(tuned_rf, 'oob_decision_function_') and tuned_rf.oob_decision_function_ is not None:
                             oob_proba = tuned_rf.oob_decision_function_[:, 1]
-                            oob_auc = float(roc_auc_score(y_train, oob_proba))
+                            oob_auc = float(roc_auc_score(y_train, oob_proba, sample_weight=sw_train)) if sw_train is not None else float(roc_auc_score(y_train, oob_proba))
                     except Exception:
                         pass
                     best_rf = tuned_rf
 
-                # Underfit -> soltar um pouco (se hold_auc muito baixo)
+                # Underfit → soltar um pouco (se hold_auc muito baixo)
                 if (hold_auc or 0) < 0.53 and (cv_auc or 0) < 0.55:
                     tuned_rf2 = RandomForestClassifier(
                         n_estimators=min(220, int(best_rf.n_estimators * 1.3)),
                         max_depth=(best_rf.max_depth or 8) + 1,
                         min_samples_leaf=max(2, int(best_rf.min_samples_leaf * 0.8)),
+                        min_samples_split=max(2, best_rf.min_samples_split - 1),
+                        max_features='auto',
+                        ccp_alpha=best_rf.ccp_alpha * 0.5,                 # ← MENOS PODA
                         random_state=self.params.get('random_state', 42),
                         class_weight='balanced_subsample',
                         bootstrap=True,
                         n_jobs=self._max_jobs,
                         oob_score=True
                     )
-                    tuned_rf2.fit(Xsel_train, y_train)
+                    fit_params_tune2 = {}
+                    if sw_train is not None:
+                        fit_params_tune2['sample_weight'] = sw_train
+                    tuned_rf2.fit(Xsel_train, y_train, **fit_params_tune2)
                     calibrated = CalibratedClassifierCV(base_estimator=tuned_rf2, method=self.calibration, cv='prefit')
-                    calibrated.fit(Xsel_hold, y_hold)
+                    if sw_hold is not None:
+                        calibrated.fit(Xsel_hold, y_hold, sample_weight=sw_hold)
+                    else:
+                        calibrated.fit(Xsel_hold, y_hold)
                     try:
                         if hasattr(tuned_rf2, 'oob_decision_function_') and tuned_rf2.oob_decision_function_ is not None:
                             oob_proba = tuned_rf2.oob_decision_function_[:, 1]
-                            oob_auc = float(roc_auc_score(y_train, oob_proba))
+                            oob_auc = float(roc_auc_score(y_train, oob_proba, sample_weight=sw_train)) if sw_train is not None else float(roc_auc_score(y_train, oob_proba))
                     except Exception:
                         pass
                     best_rf = tuned_rf2
@@ -1170,11 +1558,13 @@ class MLPatternModel:
                     'cv_splits': int(n_splits),
                     'n_samples': int(n),
                     'features_used': int(len(self.selected_features or [])),
-                    'gap_cv_holdout': float(gap) if gap is not None else None
+                    'gap_cv_holdout': float(gap) if gap is not None else None,
                 }
 
+                if metrics:
+                    self.metrics.update(metrics)  # 👈 INJETA AS MÉTRICAS EXTERNAS AQUI
+
                 q = self._compute_quality(cv_auc, hold_auc, oob_auc)
-                # suavização
                 self.quality = q
                 self.quality_smooth = float(0.7 * self.quality_smooth + 0.3 * q)
 
@@ -1203,12 +1593,11 @@ class MLPatternModel:
             return 0.5
         with self.lock:
             try:
-                # construir vetor na mesma ordem dos features
-                feat_order = self.feature_names if self.selected_features is None else self.feature_names
-                x = np.array([feature_row_dict.get(f, 0.0) for f in feat_order], dtype=float).reshape(1, -1)
+                # SEMPRE use self.feature_names para manter ordem consistente
+                x = np.array([feature_row_dict.get(f, 0.0) for f in self.feature_names], dtype=float).reshape(1, -1)
                 xs = self.scaler.transform(x)
                 if self.selector is not None:
-                    xs = self.selector.transform(xs)
+                    xs = self.selector.transform(xs)  # ← APLICA SELEÇÃO DE FEATURES!
                 proba = float(self.model.predict_proba(xs)[0, 1])
                 return proba
             except Exception as e:
@@ -1219,14 +1608,28 @@ class MLPatternModel:
 # Signal Generator (boost de confluência, gatilhos robustos, gating de qualidade)
 # =====================================================================================
 class AdvancedSignalGenerator:
-    def __init__(self, params=None, feature_builder=None, ml_model=None):
+    def __init__(self, params=None, feature_builder=None, ml_model=None, bot_manager=None, ticker='BTCUSDT'):
+        """
+        Gerador de sinais avançado com suporte a:
+        - Confluência MTF
+        - ML calibrado
+        - Filtro de regime global (BTC-driven)
+        - Gatilhos de entrada
+        - Pesos adaptativos
+        """
         self.params = deepcopy(DEFAULT_PARAMS) if params is None else deepcopy(params)
         self.feature_builder = feature_builder or MultiTimeframeFeatureBuilder()
-        self.ml_model = ml_model or MLPatternModel(self.params.get('ml', {}))
+        self.ml_model = ml_model or MLPatternModel(self.params.get('ml', {}), model_id="DEFAULT")
         self.last_signal = 'HOLD'
         self.signal_strength = 0
         self.lock = threading.Lock()
         self._regime_advisor = RegimeAdvisor(self.feature_builder)
+        
+        # 👇 Filtro de regime global baseado em BTC (só ativo se bot_manager for passado e ticker != BTC)
+        self._market_regime_filter = MarketRegimeFilter(bot_manager) if bot_manager else None
+        self.ticker = ticker  # ← usado para evitar aplicar filtro de regime em BTC
+
+        # ⚠️ NUNCA instancie outro AdvancedSignalGenerator aqui — causa recursão infinita!
 
     def set_params(self, new_params):
         with self.lock:
@@ -1346,8 +1749,13 @@ class AdvancedSignalGenerator:
             if not indicators or len(historical_data) < 30:
                 return {'signal': 'HOLD', 'strength': 0, 'reason': 'Dados insuficientes',
                         'entry_price': None, 'stop_loss': None, 'take_profit': None}
+
+            # 👇 INICIALIZA reasons CEDO para evitar "referenced before assignment"
+            reasons = []
+
             p = self.get_params()
-            w = p['weights']; th = p['thresholds']
+            w = p['weights']
+            th = p['thresholds']
 
             if df_1m is None:
                 df_1m = pd.DataFrame(historical_data)
@@ -1384,12 +1792,227 @@ class AdvancedSignalGenerator:
 
             price = float(current_data['price'])
             atr = float(indicators.get('atr', max(0.0001, price * 0.01)))
-            reasons = mtf_r + filt_r
-            # regime
+
+            # Inicializa reasons com motivos base (MTF + filtros)
+            reasons.extend(mtf_r)
+            reasons.extend(filt_r)
+
+            # 👇 Penalizar LONG se estiver em topo com divergência ou RSI extremo
+            if indicators.get('rsi', 50) > 75 or indicators.get('divergence', 0) == 1:
+                if long_score > short_score:
+                    long_score *= 0.5
+                    reasons.append("⛔ Topo Detectado: Penalizando LONG")
+                if short_score > 0:
+                    short_score *= 1.3
+                    reasons.append("✅ Reversão Esperada: Bônus para SHORT")
+
+            # 👇 Penalizar SHORT se estiver em fundo com divergência ou RSI extremo
+            if indicators.get('rsi', 50) < 25 or indicators.get('divergence', 0) == -1:
+                if short_score > long_score:
+                    short_score *= 0.5
+                    reasons.append("⛔ Fundo Detectado: Penalizando SHORT")
+                if long_score > 0:
+                    long_score *= 1.3
+                    reasons.append("✅ Reversão Esperada: Bônus para LONG")
+
+            # 👇 BÔNUS para entradas em reversão confirmada
+            if indicators.get('divergence', 0) == -1 and long_score > short_score:
+                long_score *= 1.3
+                reasons.append("✅ BÔNUS: Divergência de Alta")
+
+            if indicators.get('divergence', 0) == 1 and short_score > long_score:
+                short_score *= 1.3
+                reasons.append("✅ BÔNUS: Divergência de Baixa")
+
+            if long_score > short_score and feat_row.get('f1m_volume_drying', 0) == 1:
+                long_score *= 0.5
+                reasons.append("💧 Volume secando no topo")
+
+            # Bônus por padrão candlestick de reversão
+            if indicators.get('candle_pattern', 0) == -1 and long_score > short_score:
+                long_score *= 1.2
+                reasons.append("🕯️ Martelo Bullish")
+            elif indicators.get('candle_pattern', 0) == 1 and short_score > long_score:
+                short_score *= 1.2
+                reasons.append("🕯️ Estrela Cadente")
+
+            # Bônus por VPIN (fluxo informado)
+            vpin = feat_row.get('f1m_vpin_proxy', 0.0)
+            if vpin < -0.3 and long_score > short_score:
+                long_score *= 1.2
+                reasons.append(f"📈 VPIN Comprador ({vpin:.2f})")
+            elif vpin > 0.3 and short_score > long_score:
+                short_score *= 1.2
+                reasons.append(f"📉 VPIN Vendedor ({vpin:.2f})")
+
+            # ==============================
+            # 👇 SNIPER MODE: Força entrada se 3+ condições de reversão se alinharem
+            # ==============================
+
+            long_sniper_conditions = 0
+            short_sniper_conditions = 0
+            sniper_reasons = []
+
+            # Condições para LONG (reversão de fundo)
+            if vpin < -0.3:
+                long_sniper_conditions += 1
+                sniper_reasons.append("VPIN Comprador")
+            if indicators.get('divergence', 0) == -1:
+                long_sniper_conditions += 1
+                sniper_reasons.append("Divergência de Alta")
+            if indicators.get('rsi', 50) < 25:
+                long_sniper_conditions += 1
+                sniper_reasons.append("RSI < 25")
+            if indicators.get('candle_pattern', 0) == -1:
+                long_sniper_conditions += 1
+                sniper_reasons.append("Martelo Bullish")
+            if indicators.get('volume_drying', 0) == 1 and indicators.get('rsi', 50) < 40:
+                long_sniper_conditions += 1
+                sniper_reasons.append("Volume Secando no Fundo")
+
+            # Condições para SHORT (reversão de topo)
+            if vpin > 0.3:
+                short_sniper_conditions += 1
+                sniper_reasons.append("VPIN Vendedor")
+            if indicators.get('divergence', 0) == 1:
+                short_sniper_conditions += 1
+                sniper_reasons.append("Divergência de Baixa")
+            if indicators.get('rsi', 50) > 75:
+                short_sniper_conditions += 1
+                sniper_reasons.append("RSI > 75")
+            if indicators.get('candle_pattern', 0) == 1:
+                short_sniper_conditions += 1
+                sniper_reasons.append("Estrela Cadente")
+            if indicators.get('volume_drying', 0) == 1 and indicators.get('rsi', 50) > 60:
+                short_sniper_conditions += 1
+                sniper_reasons.append("Volume Secando no Topo")
+
+            sniper_triggered = False
+            sniper_signal = 'HOLD'
+            sniper_strength = 0
+
+            if long_sniper_conditions >= 3:
+                sniper_triggered = True
+                sniper_signal = 'BUY'
+                sniper_strength = 95.0
+                reasons = [f"🎯 SNIPER LONG ({long_sniper_conditions} condições):"] + sniper_reasons[:5]
+                logger.info(f"[SNIPER] Entrada forçada em LONG: {reasons}")
+
+            elif short_sniper_conditions >= 3:
+                sniper_triggered = True
+                sniper_signal = 'SELL'
+                sniper_strength = 95.0
+                reasons = [f"🎯 SNIPER SHORT ({short_sniper_conditions} condições):"] + sniper_reasons[:5]
+                logger.info(f"[SNIPER] Entrada forçada em SHORT: {reasons}")
+
+            # 👇 SE SNIPER FOI ATIVADO, RETORNA IMEDIATAMENTE — NÃO CONTINUA!
+            if sniper_triggered:
+                # 👇 REGIME ADVISOR — MOVIDO PARA CIMA, ANTES DO PRIMEIRO USO DE details_common
+                regime = self._regime_advisor.evaluate(df_1m.tail(600))
+                regime_profile = regime.get('profile', 'BALANCED')
+                trend_score = regime.get('trend_score', 0.5)
+                rv_pct = regime.get('rv_pct', 50.0)
+
+                # Ajuste de pesos por regime
+                if trend_score >= 0.7:
+                    w_ml_eff *= 1.2
+                    w_rule *= 0.8
+                elif trend_score <= 0.3:
+                    w_ml_eff *= 1.2
+                    w_rule *= 0.8
+                else:
+                    w_ml_eff *= 0.7
+                    w_rule *= 1.3
+                regime_good = (regime_profile in ['PREDICTIVE', 'MTF_HEAVY']) or (trend_score <= 0.35 or trend_score >= 0.65)
+
+                # Aplica filtro de regime global (baseado em BTC)
+                regime_global_score = 1.0
+                if self._market_regime_filter and self.ticker != 'BTCUSDT':
+                    regime_score = self._market_regime_filter.get_market_regime_score()
+                    regime_global_score = float(regime_score)
+                    if long_score > short_score and regime_score <= 0.3:
+                        long_score *= 0.5
+                        reasons.append(f"⚠️ Bear Market Global (BTC={regime_score:.1f})")
+                    elif short_score > long_score and regime_score >= 0.7:
+                        short_score *= 0.5
+                        reasons.append(f"⚠️ Bull Market Global (BTC={regime_score:.1f})")
+
+                # 👇 AGORA details_common É DEFINIDO ANTES DE QUALQUER USO!
+                details_common = {
+                    'rb_long': float(rb_l), 'rb_short': float(rb_s),
+                    'tf_long': float(tf_l), 'tf_short': float(tf_s),
+                    'ml_p_up': float(p_up),
+                    'ml_quality': float(quality),
+                    'ml_weight_effective': float(w_ml_eff),
+                    'filter_ok': bool(pass_f),
+                    'filter_mult': float(mult_f),
+                    'conf_boost_long': float(boost_long),
+                    'conf_boost_short': float(boost_short),
+                    'regime_profile': regime_profile,
+                    'trend_score': float(trend_score),
+                    'volume_imbalance': float(feat_row.get('f1m_volume_imbalance', 0.0)),
+                    'vpin_proxy': float(feat_row.get('f1m_vpin_proxy', 0.0)),
+                    'spread_proxy': float(feat_row.get('f1m_spread_proxy', 0.0)),
+                    'regime_global_score': regime_global_score,
+                }
+
+                # 👇 AGORA PODEMOS USAR details_common SEM PROBLEMAS
+                if not pass_f:
+                    return {
+                        'signal': 'HOLD', 'strength': 0,
+                        'reason': 'Filtros não aprovados; ' + '; '.join(reasons),
+                        'entry_price': None, 'stop_loss': None, 'take_profit': None,
+                        'details': details_common
+                    }
+
+                # Define stop e target corretos conforme o lado
+                if sniper_signal == 'BUY':
+                    stop_loss = price - atr * DEFAULT_PARAMS['risk']['atr_stop_mult']
+                    take_profit = price + atr * DEFAULT_PARAMS['risk']['atr_target_mult']
+                else:  # sniper_signal == 'SELL'
+                    stop_loss = price + atr * DEFAULT_PARAMS['risk']['atr_stop_mult']
+                    take_profit = price - atr * DEFAULT_PARAMS['risk']['atr_target_mult']
+
+                return {
+                    'signal': sniper_signal,
+                    'strength': float(sniper_strength),
+                    'reason': '; '.join(reasons[:6]),
+                    'entry_price': price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'details': details_common
+                }
+
+            # 👇 SÓ CHEGA AQUI SE NÃO HOUVE SNIPER
+
+            # Regime Advisor (se não foi chamado no sniper)
             regime = self._regime_advisor.evaluate(df_1m.tail(600))
             regime_profile = regime.get('profile', 'BALANCED')
             trend_score = regime.get('trend_score', 0.5)
+            rv_pct = regime.get('rv_pct', 50.0)
+
+            if trend_score >= 0.7:
+                w_ml_eff *= 1.2
+                w_rule *= 0.8
+            elif trend_score <= 0.3:
+                w_ml_eff *= 1.2
+                w_rule *= 0.8
+            else:
+                w_ml_eff *= 0.7
+                w_rule *= 1.3
             regime_good = (regime_profile in ['PREDICTIVE', 'MTF_HEAVY']) or (trend_score <= 0.35 or trend_score >= 0.65)
+
+            # Aplica filtro de regime global (baseado em BTC)
+            regime_global_score = 1.0
+            if self._market_regime_filter and self.ticker != 'BTCUSDT':
+                regime_score = self._market_regime_filter.get_market_regime_score()
+                regime_global_score = float(regime_score)
+                if long_score > short_score and regime_score <= 0.3:
+                    long_score *= 0.5
+                    reasons.append(f"⚠️ Bear Market Global (BTC={regime_score:.1f})")
+                elif short_score > long_score and regime_score >= 0.7:
+                    short_score *= 0.5
+                    reasons.append(f"⚠️ Bull Market Global (BTC={regime_score:.1f})")
 
             details_common = {
                 'rb_long': float(rb_l), 'rb_short': float(rb_s),
@@ -1403,41 +2026,12 @@ class AdvancedSignalGenerator:
                 'conf_boost_short': float(boost_short),
                 'regime_profile': regime_profile,
                 'trend_score': float(trend_score),
+                'volume_imbalance': float(feat_row.get('f1m_volume_imbalance', 0.0)),
+                'vpin_proxy': float(feat_row.get('f1m_vpin_proxy', 0.0)),
+                'spread_proxy': float(feat_row.get('f1m_spread_proxy', 0.0)),
+                'regime_global_score': regime_global_score,
             }
 
-            # Aplicar gatilho robusto somente quando regime é bom
-            # ============ ENTRADA PARA LONG ============
-            if (long_score >= th['buy']) and (long_score > short_score):
-                if not pass_f:
-                    return {'signal': 'HOLD', 'strength': 0,
-                            'reason': 'Filtros não aprovados; ' + '; '.join(reasons),
-                            'entry_price': None, 'stop_loss': None, 'take_profit': None,
-                            'details': details_common}
-
-                # Gatilho é BÔNUS, não obrigatório
-                trigger_ok = True
-                trig_reason = "livre"
-                if regime_good:
-                    trigger_ok, trig_reason = self._entry_triggers(df_1m, 'long')
-
-                # Aplica boost de gatilho se estiver ativo (ex: +10% no score final)
-                if trigger_ok:
-                    long_score *= 1.10  # boost opcional de 10% se gatilho confirmado
-                    trigger_note = f"✅ Trigger:{trig_reason}"
-                else:
-                    trigger_note = f"⚠️ Sem gatilho [{trig_reason}]"
-
-                return {
-                    'signal': 'BUY',
-                    'strength': float(np.clip(long_score, 0, 100)),
-                    'reason': '; '.join((rb_lr + [trigger_note] + reasons) [:6]),
-                    'entry_price': price,
-                    'stop_loss': price - atr * DEFAULT_PARAMS['risk']['atr_stop_mult'],
-                    'take_profit': price + atr * DEFAULT_PARAMS['risk']['atr_target_mult'],
-                    'details': details_common
-                }
-
-            # Aplicar gatilho robusto somente quando regime é bom
             # ============ ENTRADA PARA LONG ============
             if (long_score >= th['buy']) and (long_score > short_score):
                 if not pass_f:
@@ -1448,15 +2042,13 @@ class AdvancedSignalGenerator:
                         'details': details_common
                     }
 
-                # Gatilho é BÔNUS, não obrigatório
                 trigger_ok = True
                 trig_reason = "livre"
                 if regime_good:
                     trigger_ok, trig_reason = self._entry_triggers(df_1m, 'long')
 
-                # BÔNUS: aplica boost se gatilho ativo, mas não impede entrada
                 if trigger_ok:
-                    long_score *= 1.10  # boost opcional de 10%
+                    long_score *= 1.10
                     trigger_note = f"✅ Trigger: {trig_reason}"
                 else:
                     trigger_note = f"⚠️ Sem gatilho [{trig_reason}]"
@@ -1471,28 +2063,8 @@ class AdvancedSignalGenerator:
                     'details': details_common
                 }
 
-            # ============ ENTRADA PARA LONG ============
-            if (long_score >= th['buy']) and (long_score > short_score):
-                if not pass_f:
-                    return {
-                        'signal': 'HOLD', 'strength': 0,
-                        'reason': 'Filtros não aprovados; ' + '; '.join(reasons),
-                        'entry_price': None, 'stop_loss': None, 'take_profit': None,
-                        'details': details_common
-                    }
-
-                return {
-                    'signal': 'BUY',
-                    'strength': float(np.clip(long_score, 0, 100)),
-                    'reason': '; '.join((rb_lr + reasons)[:6]),
-                    'entry_price': price,
-                    'stop_loss': price - atr * DEFAULT_PARAMS['risk']['atr_stop_mult'],
-                    'take_profit': price + atr * DEFAULT_PARAMS['risk']['atr_target_mult'],
-                    'details': details_common
-                }
-
             # ============ ENTRADA PARA SHORT ============
-            if (short_score >= th['sell']) and (short_score > long_score):
+            elif (short_score >= th['sell']) and (short_score > long_score):
                 if not pass_f:
                     return {
                         'signal': 'HOLD', 'strength': 0,
@@ -1519,11 +2091,13 @@ class AdvancedSignalGenerator:
                 'entry_price': None, 'stop_loss': None, 'take_profit': None,
                 'details': details_common
             }
+
         except Exception as e:
             logger.error(f"Sinal: {e}")
             return {'signal': 'HOLD', 'strength': 0, 'reason': f'Erro: {str(e)}',
                     'entry_price': None, 'stop_loss': None, 'take_profit': None}
-
+        
+        
 # =====================================================================================
 # Trading Engine (maior cadência, filtro duro, exits prudentes)
 # =====================================================================================
@@ -1557,6 +2131,12 @@ class TradingEngine:
                     logger.info(f"🎯 Meta diária atingida [{self.symbol}]! P&L: ${self.total_pnl:.2f}")
                     self.daily_target_reached = True
                 return
+            
+            # Se for sinal sniper, aumenta position size em 20%
+            is_sniper = "🎯 SNIPER" in signal.get('reason', '')
+            size_factor = 1.2 if is_sniper else 1.0
+
+            self.position_size = max(0.0, (self.current_capital * size_factor) / max(1e-9, price))
 
             # gerenciar posição atual
             if self.position != 0:
@@ -1573,9 +2153,9 @@ class TradingEngine:
                     return
 
                 if signal['signal'] == 'BUY' and signal['strength'] >= 50:
-                    self._open_short(price, ts, signal, atr)   # <-- invertido
-                elif signal['signal'] == 'SELL' and signal['strength'] >= 50:
-                    self._open_long(price, ts, signal, atr)    # <-- invertido
+                    self._open_long(price, ts, signal, atr)   # <-- invertido
+                elif signal['signal'] == 'SELL' and signal['strength'] >= 50:    
+                    self._open_short(price, ts, signal, atr)
 
             if self.position != 0:
                 self._update_current_pnl(price)
@@ -1707,9 +2287,9 @@ class Backtester:
         sig = self.signal_generator_class(params=self.params,
                                           feature_builder=self.feature_builder,
                                           ml_model=MLPatternModel(self.params.get('ml', {}), model_id=f"{self.market_symbol}_BT"))
-        tfs = self.params.get('timeframes', [1, 5, 15])
+        tfs = self.params.get('timeframes', [5, 15])
         horizon = self.params.get('ml', {}).get('horizon', 3)
-        X, y, fcols, feats, aligned = self.feature_builder.build_ml_dataset(
+        X, y, fcols, feats, aligned, sample_weights = self.feature_builder.build_ml_dataset(
             df, horizon=horizon, timeframes=tfs, use_triple_barrier=True,
             atr_mult_stop=DEFAULT_PARAMS['risk']['atr_stop_mult'],
             atr_mult_target=DEFAULT_PARAMS['risk']['atr_target_mult']
@@ -1717,7 +2297,7 @@ class Backtester:
         rep = {'trained': False}
         if self.params.get('ml_enabled', True) and SKLEARN_AVAILABLE and len(y) > 0 and len(np.unique(y)) >= 2:
             cutoff = int(len(X) * initial_train_ratio)
-            sig.ml_model.train(X[:cutoff], y[:cutoff], fcols)
+            sig.ml_model.train(X[:cutoff], y[:cutoff], fcols, sample_weights=sample_weights[:cutoff] if sample_weights is not None else None)
             rep = {'trained': True}
         start = int(len(aligned) * initial_train_ratio)
         times = aligned.index
@@ -1893,7 +2473,7 @@ class AutoParamScheduler:
             return
         self._last_retrain = now
         threading.Thread(target=self.market_bot.train_ml,
-                         kwargs={'period': '7d', 'interval': '1m'},
+                         kwargs={'period': '14d', 'interval': '1m'},
                          name=f"ML-Retrain-{self.market_bot.ticker}",
                          daemon=True).start()
         logger.info(f"[{self.market_bot.ticker}] Retreino de ML disparado ({reason})")
@@ -1933,7 +2513,7 @@ class AutoParamScheduler:
 # Bot (por Mercado)
 # =====================================================================================
 class MarketTradingBot:
-    def __init__(self, ticker='BTCUSDT', market_name='BTC/USDT (Binance) | Crypto'):
+    def __init__(self, ticker='BTCUSDT', market_name='BTC/USDT (Binance) | Crypto', bot_manager=None):
         self.ticker = ticker
         self.market_name = market_name
         self.data_collector = OptimizedDataCollector(BinanceProvider(self.ticker),
@@ -1945,7 +2525,8 @@ class MarketTradingBot:
         self.ml_model = MLPatternModel(DEFAULT_PARAMS['ml'], model_id=self.ticker)
         self.signal_generator = AdvancedSignalGenerator(params=DEFAULT_PARAMS,
                                                         feature_builder=self.feature_builder,
-                                                        ml_model=self.ml_model)
+                                                        ml_model=self.ml_model,
+                                                        bot_manager=bot_manager if 'bot_manager' in globals() else None)
         self.trading_engine = TradingEngine(symbol=self.ticker)
         self.is_running = False
         self.trading_thread = None
@@ -2055,16 +2636,16 @@ class MarketTradingBot:
         horizons = [base_horizon, 1, 5]
         for tfs in tf_candidates:
             for hz in horizons:
-                X, y, fn, feats, aligned = self.feature_builder.build_ml_dataset(
+                X, y, fn, feats, aligned, sample_weights, metrics = self.feature_builder.build_ml_dataset(
                     df, horizon=hz, timeframes=tfs, use_triple_barrier=True,
                     atr_mult_stop=DEFAULT_PARAMS['risk']['atr_stop_mult'],
                     atr_mult_target=DEFAULT_PARAMS['risk']['atr_target_mult']
                 )
                 if X.size > 0 and len(y) >= 120 and len(np.unique(y)) >= 2:
-                    return X, y, fn, aligned.index, hz, tfs, 'triple_barrier'
+                    return X, y, fn, aligned.index, hz, tfs, 'triple_barrier', metrics
         return np.empty((0, 0)), np.array([]), [], [], base_horizon, base_tfs, 'failed'
 
-    def train_ml(self, period="7d", interval="1m"):
+    def train_ml(self, period="14d", interval="1m"):
         if not SKLEARN_AVAILABLE:
             return {'success': False, 'error': 'scikit-learn indisponível'}
         attempts = [(period, interval)]
@@ -2074,13 +2655,15 @@ class MarketTradingBot:
             if df is None or df.empty or len(df) < 500:
                 last_err = f"Histórico insuficiente ({per}/{inter})"
                 continue
-            tfs = self.signal_generator.get_params().get('timeframes', [1, 5, 15])
+            tfs = self.signal_generator.get_params().get('timeframes', [5, 15])
             base_hz = self.signal_generator.get_params().get('ml', {}).get('horizon', 3)
-            X, y, fn, idx, hz_used, tfs_used, method = self._build_dataset_fallback(df, base_hz, tfs)
+            X, y, fn, idx, hz_used, tfs_used, method, metrics = self._build_dataset_fallback(df, base_hz, tfs)
             if X.size == 0 or len(y) < 120 or len(np.unique(y)) < 2:
                 last_err = f"Dataset vazio ({per}, horizon={hz_used})"
                 continue
-            rep = self.ml_model.train(X, y, fn)
+            # sample_weights is not returned by _build_dataset_fallback, so set to None
+            sample_weights = None
+            rep = self.ml_model.train(X, y, fn, sample_weights=sample_weights, metrics=metrics)
             if rep.get('trained'):
                 return {'success': True, 'report': {**rep, 'period': per, 'interval': inter,
                                                     'horizon': hz_used, 'timeframes_used': tfs_used,
@@ -2111,9 +2694,23 @@ class MarketTradingBot:
 # =====================================================================================
 class BotManager:
     def __init__(self):
+        """
+        Gerenciador central de todos os bots de trading.
+        Cria uma instância de MarketTradingBot para cada mercado em MARKETS.
+        Não possui seus próprios data_collector, signal_generator, etc. — isso é responsabilidade dos bots individuais.
+        """
         self.bots = {}
         for mk, cfg in MARKETS.items():
-            self.bots[mk] = MarketTradingBot(ticker=cfg['ticker'], market_name=cfg['name'])
+            try:
+                self.bots[mk] = MarketTradingBot(
+                    ticker=cfg['ticker'],
+                    market_name=cfg['name'],
+                    bot_manager=self  # ← passa a si mesmo para permitir regime filter global
+                )
+                logger.info(f"[BotManager] Bot {mk} ({cfg['ticker']}) inicializado.")
+            except Exception as e:
+                logger.error(f"[BotManager] Falha ao inicializar bot {mk}: {e}")
+                self.bots[mk] = None
 
     def _get_bot(self, market):
         mk = normalize_market_key(market)
@@ -2233,7 +2830,7 @@ class BotManager:
             logger.exception("chart(%s) error", market)
             return {'success': False, 'error': str(e)}
 
-    def train_ml(self, market, period='7d', interval='1m'):
+    def train_ml(self, market, period='14d', interval='1m'):
         if str(market).strip().upper() == 'ALL':
             results = {}
             for mk in MARKETS.keys():
@@ -2269,7 +2866,7 @@ class BotManager:
             logger.exception("backtest(%s) error", market)
             return {'success': False, 'error': str(e)}
 
-    def optimize(self, market, period='7d', interval='1m', trials=20, objective='sharpe'):
+    def optimize(self, market, period='14d', interval='1m', trials=20, objective='sharpe'):
         if str(market).strip().upper() == 'ALL':
             results = {}
             for mk in MARKETS.keys():
